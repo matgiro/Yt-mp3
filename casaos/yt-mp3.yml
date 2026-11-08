@@ -9,13 +9,13 @@ services:
     environment:
       TZ: Europe/Paris
       MP3_QUALITY: "192"        # 128, 192, 256 ou 320
-      SUBFOLDER: ""             # ex. "YouTube" pour ranger dans /music/YouTube/Artiste/
       DEFAULT_ALBUM: "YouTube"  # album mis dans les tags si non précisé
       MAX_DURATION: "900"       # ignore les vidéos de plus de 15 min (0 = pas de limite)
-      PLAYLIST_DIR: "Playlists" # dossier (dans la musique) où sont écrites les playlists .m3u pour Navidrome
+      MUSIC_DIR: "/DATA/Media/Music" # dossier par défaut (modifiable ensuite dans ⚙ Réglages de l'appli)
       SEARCH_RESULTS: "6"       # nb de résultats YouTube comparés pour choisir la bonne version
     volumes:
-      - /DATA/Media/Music:/music        # DOIT être le même dossier que celui de Navidrome
+      - /DATA:/DATA                     # stockage CasaOS (choix du dossier dans ⚙ Réglages)
+      - /media:/media                   # disques externes / USB
       - /DATA/AppData/yt-mp3:/data      # file d'attente / historique
 
 x-casaos:

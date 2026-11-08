@@ -9,25 +9,40 @@ import os
 import re
 import threading
 import queue
+import shutil
 import time
+from glob import escape as glob_escape
 import urllib.request
 import uuid
 from pathlib import Path
 
 import yt_dlp
-from flask import Flask, jsonify, request, render_template_string
+from flask import Flask, jsonify, request
 from mutagen.easyid3 import EasyID3
 from mutagen.id3 import ID3NoHeaderError
 
-MUSIC_DIR = Path(os.environ.get("MUSIC_DIR", "/music"))
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
-SUBFOLDER = os.environ.get("SUBFOLDER", "").strip()
+# Dossiers de l'hôte visibles dans le conteneur (montés au même chemin) et explorables dans les réglages
+BROWSE_ROOTS = [Path(p.strip()) for p in os.environ.get("BROWSE_ROOTS", "/DATA,/media").split(",") if p.strip()]
+_env_music = os.environ.get("MUSIC_DIR", "/DATA/Media/Music")
+_env_sub = os.environ.get("SUBFOLDER", "").strip()
+DEFAULT_SETTINGS = {
+    "music_dir": str(Path(_env_music) / _env_sub) if _env_sub else _env_music,
+    "layout": os.environ.get("LAYOUT", "artist"),          # flat | artist | artist_album
+    "playlist_dir": os.environ.get("PLAYLIST_DIR", "Playlists").strip() or "Playlists",
+}
+LAYOUTS = {
+    "flat": "Tout dans le même dossier",
+    "artist": "Artiste / Artiste - Titre.mp3",
+    "artist_album": "Artiste / Album / Artiste - Titre.mp3",
+}
+SETTINGS_FILE = DATA_DIR / "settings.json"
+TMP_DIR = DATA_DIR / "tmp"
 QUALITY = os.environ.get("MP3_QUALITY", "192")
 DEFAULT_ALBUM = os.environ.get("DEFAULT_ALBUM", "YouTube")
 MAX_DURATION = int(os.environ.get("MAX_DURATION", "900"))  # secondes, 0 = pas de limite
 SEARCH_SUFFIX = os.environ.get("SEARCH_SUFFIX", "audio")
 SEARCH_RESULTS = int(os.environ.get("SEARCH_RESULTS", "6"))
-PLAYLIST_DIR = os.environ.get("PLAYLIST_DIR", "Playlists").strip() or "Playlists"
 STATE_FILE = DATA_DIR / "jobs.json"
 
 app = Flask(__name__)
@@ -66,6 +81,43 @@ def load_state():
     for imp in imports:  # une analyse interrompue ne reprend pas toute seule
         if imp["status"] == "resolving":
             imp.update(status="error", message="Interrompu par un redémarrage — recolle le lien")
+
+
+# ---------------------------------------------------------------- réglages
+settings: dict = dict(DEFAULT_SETTINGS)
+
+
+def load_settings():
+    global settings
+    try:
+        settings = {**DEFAULT_SETTINGS, **json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))}
+    except Exception:
+        settings = dict(DEFAULT_SETTINGS)
+
+
+def music_dir() -> Path:
+    return Path(settings["music_dir"])
+
+
+def playlist_folder() -> Path:
+    return music_dir() / settings["playlist_dir"]
+
+
+def inside_roots(p: Path) -> bool:
+    rp = p.resolve()
+    return any(rp == r.resolve() or r.resolve() in rp.parents for r in BROWSE_ROOTS)
+
+
+def check_writable(p: Path):
+    if not inside_roots(p):
+        raise ValueError(f"Le dossier doit être dans : {', '.join(map(str, BROWSE_ROOTS))}")
+    p.mkdir(parents=True, exist_ok=True)
+    test = p / ".yt-mp3-test"
+    try:
+        test.write_text("ok")
+        test.unlink()
+    except OSError as e:
+        raise ValueError(f"Impossible d'écrire dans {p} : {e.strerror}") from e
 
 
 def get_job(job_id):
@@ -312,7 +364,7 @@ def write_m3u(name: str):
     with lock:
         files = [j["file"] for j in jobs
                  if j.get("playlist") == name and j.get("file") and j["status"] in ("done", "exists")]
-    folder = MUSIC_DIR / PLAYLIST_DIR
+    folder = playlist_folder()
     folder.mkdir(parents=True, exist_ok=True)
     seen, lines = set(), ["#EXTM3U"]
     for f in files:
@@ -413,15 +465,24 @@ def process(job):
 
     update(job, found=found, video_url=video_url, artist=artist, title=title)
 
-    # chemin de destination
-    root = MUSIC_DIR / SUBFOLDER if SUBFOLDER else MUSIC_DIR
-    folder = root / safe(artist)
+    # déjà présent ? (avec l'organisation de dossiers actuelle)
+    root, layout = music_dir(), settings["layout"]
     base = safe(f"{artist} - {title}")
-    final = folder / f"{base}.mp3"
-    if final.exists():
-        update(job, status="exists", progress=100, message="Déjà présent", file=str(final))
+    if layout == "flat":
+        existing = root / f"{base}.mp3"
+        existing = existing if existing.exists() else None
+    else:
+        artist_dir = root / safe(artist)
+        existing = next(artist_dir.glob(f"**/{glob_escape(base)}.mp3"), None) if artist_dir.is_dir() else None
+    if existing:
+        update(job, status="exists", progress=100, message="Déjà présent", file=str(existing))
         return
-    folder.mkdir(parents=True, exist_ok=True)
+
+    # on télécharge dans un dossier temporaire, puis on range le fichier fini
+    work = TMP_DIR / job["id"]
+    shutil.rmtree(work, ignore_errors=True)
+    work.mkdir(parents=True, exist_ok=True)
+    tmp_mp3 = work / f"{base}.mp3"
 
     def hook(d):
         if d["status"] == "downloading":
@@ -435,7 +496,7 @@ def process(job):
     opts = {
         **base_opts,
         "format": "bestaudio/best",
-        "outtmpl": str(folder / f"{base}.%(ext)s"),
+        "outtmpl": str(work / f"{base}.%(ext)s"),
         "writethumbnail": True,
         "progress_hooks": [hook],
         "postprocessors": [
@@ -444,13 +505,25 @@ def process(job):
             {"key": "EmbedThumbnail"},
         ],
     }
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        full = ydl.extract_info(video_url, download=True) or {}
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            full = ydl.extract_info(video_url, download=True) or {}
+        if not tmp_mp3.exists():
+            raise RuntimeError("Fichier MP3 introuvable après conversion")
+        album = job.get("album") or full.get("album") or DEFAULT_ALBUM
+        tag_mp3(tmp_mp3, artist, title, album, full.get("release_year") or "")
 
-    if not final.exists():
-        raise RuntimeError("Fichier MP3 introuvable après conversion")
-    album = job.get("album") or full.get("album") or DEFAULT_ALBUM
-    tag_mp3(final, artist, title, album, full.get("release_year") or "")
+        if layout == "flat":
+            folder = root
+        elif layout == "artist_album":
+            folder = root / safe(artist) / safe(album)
+        else:
+            folder = root / safe(artist)
+        folder.mkdir(parents=True, exist_ok=True)
+        final = folder / f"{base}.mp3"
+        shutil.move(str(tmp_mp3), str(final))
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
     update(job, status="done", progress=100, message="OK", file=str(final), album=album)
 
 
@@ -569,10 +642,74 @@ def api_clear():
     return jsonify({"ok": True})
 
 
+@app.get("/api/settings")
+def api_settings():
+    return jsonify({**settings, "layouts": LAYOUTS, "roots": [str(r) for r in BROWSE_ROOTS if r.is_dir()]})
+
+
+@app.post("/api/settings")
+def api_settings_save():
+    global settings
+    body = request.get_json(silent=True) or {}
+    new = dict(settings)
+    if "music_dir" in body:
+        p = Path(str(body["music_dir"]).strip() or "/")
+        if not p.is_absolute():
+            return jsonify({"error": "Le chemin doit commencer par /"}), 400
+        try:
+            check_writable(p)
+        except ValueError as e:
+            return jsonify({"error": str(e)}), 400
+        new["music_dir"] = str(p.resolve())
+    if body.get("layout") in LAYOUTS:
+        new["layout"] = body["layout"]
+    if "playlist_dir" in body:
+        pd = str(body["playlist_dir"]).strip().strip("/")
+        if not pd or ".." in Path(pd).parts:
+            return jsonify({"error": "Nom de dossier de playlists invalide"}), 400
+        new["playlist_dir"] = pd
+    settings = new
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    SETTINGS_FILE.write_text(json.dumps(settings, ensure_ascii=False, indent=1), encoding="utf-8")
+    return api_settings()
+
+
+@app.get("/api/browse")
+def api_browse():
+    roots = [r for r in BROWSE_ROOTS if r.is_dir()]
+    raw = request.args.get("path", "").strip()
+    if not raw:
+        return jsonify({"path": "", "parent": None, "dirs": [str(r) for r in roots], "writable": False})
+    p = Path(raw)
+    if not p.is_absolute() or not inside_roots(p) or not p.is_dir():
+        return jsonify({"error": "Dossier inaccessible"}), 400
+    p = p.resolve()
+    try:
+        dirs = sorted((d.name for d in p.iterdir() if d.is_dir() and not d.name.startswith(".")), key=str.lower)
+    except OSError as e:
+        return jsonify({"error": e.strerror}), 400
+    parent = "" if any(p == r.resolve() for r in roots) else str(p.parent)
+    return jsonify({"path": str(p), "parent": parent, "dirs": [str(p / d) for d in dirs],
+                    "writable": os.access(p, os.W_OK)})
+
+
+@app.post("/api/mkdir")
+def api_mkdir():
+    body = request.get_json(silent=True) or {}
+    name = safe(str(body.get("name", "")))
+    parent = Path(str(body.get("path", "")))
+    if not parent.is_absolute() or not inside_roots(parent) or not parent.is_dir():
+        return jsonify({"error": "Dossier parent inaccessible"}), 400
+    try:
+        (parent / name).mkdir(exist_ok=True)
+    except OSError as e:
+        return jsonify({"error": e.strerror}), 400
+    return jsonify({"path": str((parent / name).resolve())})
+
+
 @app.get("/")
 def index():
-    dest = str(MUSIC_DIR / SUBFOLDER) if SUBFOLDER else str(MUSIC_DIR)
-    return render_template_string(PAGE, music_dir=dest, playlist_dir=str(MUSIC_DIR / PLAYLIST_DIR))
+    return PAGE
 
 
 PAGE = r"""<!doctype html>
@@ -606,12 +743,44 @@ td{padding:8px 6px;border-top:1px solid var(--line);vertical-align:top}
 .done,.exists,.ok{color:var(--ok)}.error{color:var(--acc)}.downloading,.searching,.resolving{color:var(--warn)}
 .empty{color:var(--mut);text-align:center;padding:20px}
 code{background:#0c0e12;padding:1px 5px;border-radius:4px}
-#impcard{display:none}
+#impcard,#setcard,#browser{display:none}
+button.link{background:none;border:none;color:var(--txt);text-decoration:underline;padding:0 4px;font-size:13px}
+.field{margin-top:12px}.field label{display:block;font-size:13px;color:var(--mut);margin-bottom:4px}
+.hint{font-size:12px;color:var(--mut);margin-top:4px}
+select{background:#0c0e12;color:var(--txt);border:1px solid var(--line);border-radius:8px;padding:8px 10px;font:inherit;width:100%}
+#browser{margin-top:10px;border:1px solid var(--line);border-radius:8px;padding:10px;background:#12151b}
+#b_list{max-height:260px;overflow:auto;margin-top:8px}
+#b_list div{padding:6px 8px;border-radius:6px;cursor:pointer}#b_list div:hover{background:#262b36}
+.toast.err{color:var(--acc)}
 </style></head><body><main>
 <h1>YT <span>MP3</span></h1>
 <p class="sub">Une ligne par chanson : <code>Artiste - Titre</code> (option : <code>Artiste - Titre - Album</code>), une URL YouTube,
 ou un lien de <b>playlist / album Spotify, Deezer ou YouTube</b>. Les lignes commençant par # sont ignorées.<br>
-Musique : <code>{{ music_dir }}</code> · Playlists Navidrome : <code>{{ playlist_dir }}</code></p>
+Musique : <code id="curdir">…</code> · Playlists Navidrome : <code id="curpl">…</code>
+<button class="link" onclick="openSettings()">⚙ Réglages</button></p>
+
+<div class="card" id="setcard">
+<strong>Réglages de stockage</strong>
+<div class="field"><label>Dossier de la musique</label>
+ <div class="row" style="margin:0"><input type="text" id="s_dir" style="max-width:none;flex:1"><button onclick="browse($('s_dir').value)">Parcourir…</button></div>
+ <div class="hint">Il doit être dans la bibliothèque de Navidrome (ou être le dossier de la bibliothèque lui-même).</div>
+</div>
+<div id="browser">
+ <div class="crumb"><code id="b_path"></code></div>
+ <div id="b_list"></div>
+ <div class="row">
+  <button onclick="browse(B.parent??'')" id="b_up">⬆ Dossier parent</button>
+  <input type="text" id="b_new" placeholder="Nouveau dossier" style="max-width:180px"><button onclick="mkdir()">Créer</button>
+  <button class="primary" style="margin-left:auto" onclick="pick()" id="b_pick">Choisir ce dossier</button>
+ </div>
+</div>
+<div class="row">
+ <div class="field" style="flex:1;min-width:220px"><label>Organisation des fichiers</label><select id="s_layout"></select></div>
+ <div class="field" style="flex:1;min-width:220px"><label>Sous-dossier des playlists .m3u</label><input type="text" id="s_pl" style="max-width:none"></div>
+</div>
+<div class="row"><button class="primary" onclick="saveSettings()">Enregistrer</button><button onclick="$('setcard').style.display='none'">Fermer</button>
+ <span id="s_msg" class="toast"></span></div>
+</div>
 
 <div class="card">
 <textarea id="txt" placeholder="Daft Punk - Get Lucky&#10;Stromae - Alors on danse&#10;https://open.spotify.com/playlist/...&#10;https://www.deezer.com/fr/playlist/...&#10;https://www.youtube.com/playlist?list=..."></textarea>
@@ -701,14 +870,40 @@ async function refresh(){try{const d=await (await fetch('/api/jobs')).json();con
    ${['downloading','searching'].includes(j.status)?`<div class="bar"><i style="width:${j.progress||0}%"></i></div>`:''}</td>
   <td style="text-align:right"><span class="st ${j.status}">${LBL[j.status]||j.status}</span></td></tr>`).join('')
   :'<tr><td class="empty">Rien pour l\'instant — colle une liste ou un lien de playlist ci-dessus.</td></tr>';}catch(e){}}
-refresh();setInterval(refresh,2000);
+let S={},B={};
+function smsg(m,err){const e=$('s_msg');e.textContent=m;e.className='toast'+(err?' err':'');}
+function showSettings(){$('curdir').textContent=S.music_dir;$('curpl').textContent=S.music_dir+'/'+S.playlist_dir;}
+async function loadSettings(){S=await (await fetch('/api/settings')).json();showSettings();}
+function openSettings(){$('s_dir').value=S.music_dir;$('s_pl').value=S.playlist_dir;
+ $('s_layout').innerHTML=Object.entries(S.layouts).map(([k,v])=>`<option value="${k}"${k===S.layout?' selected':''}>${esc(v)}</option>`).join('');
+ $('browser').style.display='none';smsg('');$('setcard').style.display='block';}
+async function browse(p){const r=await fetch('/api/browse?path='+encodeURIComponent(p||''));let d=await r.json();
+ if(!r.ok){if(p){return browse('');}smsg(d.error,true);return;}
+ B=d;$('browser').style.display='block';
+ $('b_path').textContent=d.path||'Emplacements disponibles';
+ $('b_up').disabled=d.parent===null;$('b_pick').disabled=!d.path;
+ $('b_list').innerHTML=d.dirs.length?d.dirs.map(x=>`<div data-p="${esc(x)}">📁 ${esc(d.path?x.split('/').pop():x)}</div>`).join(''):'<div class="hint">Aucun sous-dossier</div>';
+ $('b_list').querySelectorAll('[data-p]').forEach(el=>el.onclick=()=>browse(el.dataset.p));}
+async function mkdir(){const n=$('b_new').value.trim();if(!n||!B.path)return;
+ const r=await fetch('/api/mkdir',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({path:B.path,name:n})});
+ const d=await r.json();if(!r.ok){smsg(d.error,true);return;}$('b_new').value='';browse(d.path);}
+function pick(){if(!B.path)return;$('s_dir').value=B.path;$('browser').style.display='none';smsg('Dossier sélectionné — pense à enregistrer');}
+async function saveSettings(){const r=await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},
+  body:JSON.stringify({music_dir:$('s_dir').value,layout:$('s_layout').value,playlist_dir:$('s_pl').value})});
+ const d=await r.json();if(!r.ok){smsg(d.error,true);return;}S=d;showSettings();smsg('Enregistré ✔ — les prochains téléchargements iront ici');}
+loadSettings();refresh();setInterval(refresh,2000);
 </script></body></html>"""
 
 
 if __name__ == "__main__":
-    MUSIC_DIR.mkdir(parents=True, exist_ok=True)
+    load_settings()
+    try:
+        music_dir().mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        print(f"Attention : dossier musique {music_dir()} inaccessible ({e.strerror})", flush=True)
+    shutil.rmtree(TMP_DIR, ignore_errors=True)
     load_state()
     threading.Thread(target=worker, daemon=True).start()
     from waitress import serve
-    print(f"YT-MP3 prêt sur :8080 — musique dans {MUSIC_DIR}", flush=True)
+    print(f"YT-MP3 prêt sur :8080 — musique dans {music_dir()}", flush=True)
     serve(app, host="0.0.0.0", port=8080, threads=4)

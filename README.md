@@ -11,7 +11,15 @@ la bibliothèque Navidrome, avec la playlist `.m3u` correspondante.
 3. Colle le contenu de [`casaos/yt-mp3.yml`](casaos/yt-mp3.yml) → **Valider** → **Installer**.
 4. L'icône **YT MP3** apparaît sur le tableau de bord (port 8095).
 
-Le volume `/DATA/Media/Music` doit être le même dossier que celui utilisé par Navidrome.
+## Choisir où est stockée la musique
+
+Dans l'appli, clique sur **⚙ Réglages** (en haut) :
+- **Dossier de la musique** : bouton *Parcourir…* pour naviguer dans `/DATA` (stockage CasaOS) et `/media`
+  (disques USB / externes), créer un dossier si besoin, puis *Choisir ce dossier* → *Enregistrer*.
+- **Organisation** : tout à plat, `Artiste/`, ou `Artiste/Album/`.
+- **Sous-dossier des playlists** `.m3u` (par défaut `Playlists`).
+
+Le dossier choisi doit être dans la bibliothèque de Navidrome. Par défaut : `/DATA/Media/Music`.
 
 ## Mise à jour
 
