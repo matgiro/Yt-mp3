@@ -16,7 +16,7 @@ la bibliothèque Navidrome, avec la playlist `.m3u` correspondante.
 Dans l'appli, clique sur **⚙ Réglages** (en haut) :
 - **Dossier de la musique** : bouton *Parcourir…* pour naviguer dans `/DATA` (stockage CasaOS) et `/media`
   (disques USB / externes), créer un dossier si besoin, puis *Choisir ce dossier* → *Enregistrer*.
-- **Organisation** : tout à plat, `Artiste/`, ou `Artiste/Album/`.
+- **Organisation** : `Artiste/Album/` (par défaut), `Artiste/`, ou tout à plat.
 - **Sous-dossier des playlists** `.m3u` (par défaut `Playlists`).
 
 Le dossier choisi doit être dans la bibliothèque de Navidrome. Par défaut : `/DATA/Media/Music`.

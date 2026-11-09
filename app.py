@@ -11,6 +11,7 @@ import threading
 import queue
 import shutil
 import time
+import unicodedata
 from glob import escape as glob_escape
 import urllib.request
 import uuid
@@ -28,7 +29,7 @@ _env_music = os.environ.get("MUSIC_DIR", "/DATA/Media/Music")
 _env_sub = os.environ.get("SUBFOLDER", "").strip()
 DEFAULT_SETTINGS = {
     "music_dir": str(Path(_env_music) / _env_sub) if _env_sub else _env_music,
-    "layout": os.environ.get("LAYOUT", "artist"),          # flat | artist | artist_album
+    "layout": os.environ.get("LAYOUT", "artist_album"),          # flat | artist | artist_album
     "playlist_dir": os.environ.get("PLAYLIST_DIR", "Playlists").strip() or "Playlists",
 }
 LAYOUTS = {
@@ -379,32 +380,62 @@ BAD_WORDS = ["live", "cover", "karaoke", "instrumental", "remix", "8d", "sped up
              "nightcore", "reaction", "tutorial", "piano version", "acoustic"]
 
 
-def pick(entries, job):
-    """Choisit le meilleur résultat : bonne durée, pas de live/cover, chaîne officielle."""
-    want = f"{job.get('title', '')} {job.get('album', '')}".lower()
+NOISE_TOKENS = {"official", "officiel", "officielle", "video", "videoclip", "audio", "lyrics", "lyric", "paroles",
+                "music", "musique", "clip", "hd", "hq", "4k", "visualizer", "visualiser", "remastered", "remaster",
+                "topic", "the", "a", "le", "la", "les", "mv", "full", "explicit"}
+
+
+def tokens(s: str) -> set:
+    s = unicodedata.normalize("NFKD", s or "").encode("ascii", "ignore").decode().lower()
+    s = re.sub(r"[\(\[][^\)\]]*[\)\]]", " ", s)          # (Official Video), [HD], (feat. X)…
+    s = re.split(r"\b(?:feat|ft|featuring)\b", s)[0]
+    return {t for t in re.findall(r"[a-z0-9]+", s) if t not in NOISE_TOKENS}
+
+
+def score_entry(rank, e, job):
+    """Plus le score est bas, meilleur est le résultat. None = résultat rejeté."""
+    raw = (e.get("title") or "").lower()
+    ch = (e.get("channel") or e.get("uploader") or "").lower()
+    d = e.get("duration") or 0
+    if MAX_DURATION and d > MAX_DURATION:
+        return None
+    want_title = (job.get("title") or "").lower()
+    want = tokens(search_title(job.get("title") or ""))
+    art = tokens(job.get("artist") or "")
+    cand = tokens(e.get("title") or "") - art
+    score = rank * 2
+
+    # 1) le titre doit correspondre (c'est ce qui manquait : un autre morceau du même artiste passait)
+    if want:
+        cov = len(want & cand) / len(want)
+        if cov < 0.6:
+            return None
+        score += (1 - cov) * 80
+        score += min(len(cand - want), 6) * 10          # mots en trop : "Hole" ≠ "Hole In Your Heart"
+    # 2) le bon artiste (dans le titre de la vidéo ou le nom de la chaîne)
+    if art and not (art & (tokens(e.get("title") or "") | tokens(ch))):
+        score += 30
+    # 3) pas de live / cover / remix… sauf si demandé
+    for w in BAD_WORDS:
+        if re.search(rf"\b{re.escape(w)}\b", raw) and w not in want_title:
+            score += 40
+    # 4) durée proche de l'original (Deezer / Spotify / CSV)
     target = job.get("duration") or 0
-    artist = (job.get("artist") or "").lower()
-    best = None
-    for rank, e in enumerate(entries):
-        d = e.get("duration") or 0
-        if MAX_DURATION and d > MAX_DURATION:
-            continue
-        t = (e.get("title") or "").lower()
-        ch = (e.get("channel") or e.get("uploader") or "").lower()
-        score = rank * 2
-        for w in BAD_WORDS:
-            if re.search(rf"\b{re.escape(w)}\b", t) and w not in want:
-                score += 25
-        if target and d:
-            diff = abs(d - target)
-            score += diff if diff <= 60 else 100 + diff
-        if ch.endswith(" - topic"):
-            score -= 6
-        if artist and (artist in t or artist in ch):
-            score -= 3
-        if best is None or score < best[0]:
-            best = (score, e)
-    return best[1] if best else None
+    if target and d:
+        diff = abs(d - target)
+        score += diff if diff <= 15 else 15 + (diff - 15) * 3
+        if diff > 90:
+            return None
+    # 5) bonus chaîne officielle "Artiste - Topic"
+    if ch.endswith(" - topic"):
+        score -= 8
+    return score
+
+
+def pick(entries, job):
+    scored = [(score_entry(i, e, job), e) for i, e in enumerate(entries)]
+    ok = [(s, e) for s, e in scored if s is not None]
+    return min(ok, key=lambda x: x[0])[1] if ok else None
 
 
 def guess_from_info(info, job):
@@ -446,16 +477,27 @@ def process(job):
         found = info.get("title", "")
         artist, title = guess_from_info(info, job)
     else:
-        q = f"{job['artist']} {search_title(job['title'])} {SEARCH_SUFFIX}".strip()
+        core = f"{job['artist']} {search_title(job['title'])}".strip()
+        queries = [f"{core} {SEARCH_SUFFIX}".strip(), core, f"{core} lyrics"]
         opts = {**base_opts, "skip_download": True, "extract_flat": "in_playlist"}
+        seen, entries, best = set(), [], None
         with yt_dlp.YoutubeDL(opts) as ydl:
-            res = ydl.extract_info(f"ytsearch{SEARCH_RESULTS}:{q}", download=False)
-        entries = [e for e in (res or {}).get("entries") or [] if e and e.get("id")]
+            for q in dict.fromkeys(queries):          # sans doublons, dans l'ordre
+                res = ydl.extract_info(f"ytsearch{SEARCH_RESULTS}:{q}", download=False)
+                for e in (res or {}).get("entries") or []:
+                    if e and e.get("id") and e["id"] not in seen:
+                        seen.add(e["id"])
+                        entries.append(e)
+                best = pick(entries, job)
+                if best:
+                    break
         if not entries:
             raise RuntimeError("Aucun résultat sur YouTube")
-        best = pick(entries, job)
         if not best:
-            raise RuntimeError("Seulement des vidéos trop longues trouvées")
+            update(job, found=f"plus proche : {entries[0].get('title', '')}",
+                   video_url=f"https://www.youtube.com/watch?v={entries[0]['id']}")
+            raise RuntimeError("Pas de version fiable trouvée (titre ou durée différents) — "
+                               "clique sur « Corriger » pour donner le bon lien YouTube")
         video_url = f"https://www.youtube.com/watch?v={best['id']}"
         found = best.get("title", "")
         if job["artist"]:
@@ -474,7 +516,7 @@ def process(job):
     else:
         artist_dir = root / safe(artist)
         existing = next(artist_dir.glob(f"**/{glob_escape(base)}.mp3"), None) if artist_dir.is_dir() else None
-    if existing:
+    if existing and not job.get("force"):
         update(job, status="exists", progress=100, message="Déjà présent", file=str(existing))
         return
 
@@ -521,10 +563,13 @@ def process(job):
             folder = root / safe(artist)
         folder.mkdir(parents=True, exist_ok=True)
         final = folder / f"{base}.mp3"
+        old = Path(job["file"]) if job.get("force") and job.get("file") else None
+        if old and old != final and old.exists():
+            old.unlink()                                  # on remplace la mauvaise version
         shutil.move(str(tmp_mp3), str(final))
     finally:
         shutil.rmtree(work, ignore_errors=True)
-    update(job, status="done", progress=100, message="OK", file=str(final), album=album)
+    update(job, status="done", progress=100, message="OK", file=str(final), album=album, force=False)
 
 
 def worker():
@@ -629,6 +674,23 @@ def api_retry():
                 n += 1
     save_state()
     return jsonify({"retried": n})
+
+
+@app.post("/api/fix")
+def api_fix():
+    body = request.get_json(silent=True) or {}
+    url = str(body.get("url", "")).strip()
+    if not re.match(r"^https?://(www\.|m\.|music\.)?(youtube\.com|youtu\.be)/", url):
+        return jsonify({"error": "Colle un lien de vidéo YouTube"}), 400
+    job = get_job(str(body.get("id", "")))
+    if not job:
+        return jsonify({"error": "Titre introuvable"}), 404
+    if job["status"] in ACTIVE:
+        return jsonify({"error": "Ce titre est déjà en cours"}), 400
+    update(job, url=url, force=True, status="pending", progress=0, message="En attente (correction)", found="")
+    work_queue.put(job["id"])
+    save_state()
+    return jsonify({"ok": True})
 
 
 @app.post("/api/clear")
@@ -752,6 +814,7 @@ select{background:#0c0e12;color:var(--txt);border:1px solid var(--line);border-r
 #b_list{max-height:260px;overflow:auto;margin-top:8px}
 #b_list div{padding:6px 8px;border-radius:6px;cursor:pointer}#b_list div:hover{background:#262b36}
 .toast.err{color:var(--acc)}
+button.mini{padding:2px 8px;font-size:12px;border-radius:6px}
 </style></head><body><main>
 <h1>YT <span>MP3</span></h1>
 <p class="sub">Une ligne par chanson : <code>Artiste - Titre</code> (option : <code>Artiste - Titre - Album</code>), une URL YouTube,
@@ -868,8 +931,11 @@ async function refresh(){try{const d=await (await fetch('/api/jobs')).json();con
   <td><div class="l">${esc(j.artist?j.artist+' - '+j.title:(j.title||j.line))}${j.playlist?`<span class="pl">${esc(j.playlist)}</span>`:''}</div>
    <div class="f">${j.found?'▶ '+(j.video_url?`<a href="${esc(j.video_url)}" target="_blank">${esc(j.found)}</a>`:esc(j.found)):''}${j.status==='error'?'<br>'+esc(j.message):''}</div>
    ${['downloading','searching'].includes(j.status)?`<div class="bar"><i style="width:${j.progress||0}%"></i></div>`:''}</td>
-  <td style="text-align:right"><span class="st ${j.status}">${LBL[j.status]||j.status}</span></td></tr>`).join('')
+  <td style="text-align:right;white-space:nowrap">${['done','exists','error'].includes(j.status)?`<button class="mini" onclick="fix('${j.id}')">Corriger</button> `:''}<span class="st ${j.status}">${LBL[j.status]||j.status}</span></td></tr>`).join('')
   :'<tr><td class="empty">Rien pour l\'instant — colle une liste ou un lien de playlist ci-dessus.</td></tr>';}catch(e){}}
+async function fix(id){const u=prompt("Colle le lien YouTube de la bonne version de ce morceau :");if(!u)return;
+ const r=await fetch('/api/fix',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id,url:u.trim()})});
+ const d=await r.json();toast(r.ok?'Correction en cours…':d.error);refresh();}
 let S={},B={};
 function smsg(m,err){const e=$('s_msg');e.textContent=m;e.className='toast'+(err?' err':'');}
 function showSettings(){$('curdir').textContent=S.music_dir;$('curpl').textContent=S.music_dir+'/'+S.playlist_dir;}
