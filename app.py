@@ -22,6 +22,7 @@ from flask import Flask, jsonify, request
 from mutagen.easyid3 import EasyID3
 from mutagen.id3 import ID3NoHeaderError
 
+APP_VERSION = "2026.11.09-1"
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
 # Dossiers de l'hôte visibles dans le conteneur (montés au même chemin) et explorables dans les réglages
 BROWSE_ROOTS = [Path(p.strip()) for p in os.environ.get("BROWSE_ROOTS", "/DATA,/media").split(",") if p.strip()]
@@ -771,7 +772,7 @@ def api_mkdir():
 
 @app.get("/")
 def index():
-    return PAGE
+    return PAGE.replace("__VERSION__", APP_VERSION)
 
 
 PAGE = r"""<!doctype html>
@@ -816,7 +817,7 @@ select{background:#0c0e12;color:var(--txt);border:1px solid var(--line);border-r
 .toast.err{color:var(--acc)}
 button.mini{padding:2px 8px;font-size:12px;border-radius:6px}
 </style></head><body><main>
-<h1>YT <span>MP3</span></h1>
+<h1>YT <span>MP3</span> <small style="font-size:12px;color:var(--mut);font-weight:400">version __VERSION__</small></h1>
 <p class="sub">Une ligne par chanson : <code>Artiste - Titre</code> (option : <code>Artiste - Titre - Album</code>), une URL YouTube,
 ou un lien de <b>playlist / album Spotify, Deezer ou YouTube</b>. Les lignes commençant par # sont ignorées.<br>
 Musique : <code id="curdir">…</code> · Playlists Navidrome : <code id="curpl">…</code>
@@ -971,5 +972,5 @@ if __name__ == "__main__":
     load_state()
     threading.Thread(target=worker, daemon=True).start()
     from waitress import serve
-    print(f"YT-MP3 prêt sur :8080 — musique dans {music_dir()}", flush=True)
+    print(f"YT-MP3 {APP_VERSION} prêt sur :8080 — musique dans {music_dir()}", flush=True)
     serve(app, host="0.0.0.0", port=8080, threads=4)
