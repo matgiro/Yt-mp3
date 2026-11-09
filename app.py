@@ -22,7 +22,7 @@ from flask import Flask, jsonify, request
 from mutagen.easyid3 import EasyID3
 from mutagen.id3 import ID3NoHeaderError
 
-APP_VERSION = "2026.11.09-1"
+APP_VERSION = "2026.11.09-2"
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
 # Dossiers de l'hôte visibles dans le conteneur (montés au même chemin) et explorables dans les réglages
 BROWSE_ROOTS = [Path(p.strip()) for p in os.environ.get("BROWSE_ROOTS", "/DATA,/media").split(",") if p.strip()]
@@ -32,6 +32,12 @@ DEFAULT_SETTINGS = {
     "music_dir": str(Path(_env_music) / _env_sub) if _env_sub else _env_music,
     "layout": os.environ.get("LAYOUT", "artist_album"),          # flat | artist | artist_album
     "playlist_dir": os.environ.get("PLAYLIST_DIR", "Playlists").strip() or "Playlists",
+    "numbering": os.environ.get("NUMBERING", "album"),     # album | playlist | none
+}
+NUMBERINGS = {
+    "album": "N° de piste dans l'album (01 - Artiste - Titre.mp3)",
+    "playlist": "Position dans la playlist (01 - Artiste - Titre.mp3)",
+    "none": "Pas de numéro",
 }
 LAYOUTS = {
     "flat": "Tout dans le même dossier",
@@ -198,7 +204,7 @@ def search_title(t: str) -> str:
     return re.sub(r"\s+-\s+.*remaster.*$", "", t, flags=re.I).strip()
 
 
-def tag_mp3(path: Path, artist: str, title: str, album: str, year: str = ""):
+def tag_mp3(path: Path, artist: str, title: str, album: str, year: str = "", track: int = 0, disc: int = 0):
     try:
         tags = EasyID3(str(path))
     except ID3NoHeaderError:
@@ -215,6 +221,10 @@ def tag_mp3(path: Path, artist: str, title: str, album: str, year: str = ""):
     tags["album"] = album or DEFAULT_ALBUM
     if year:
         tags["date"] = str(year)
+    if track:
+        tags["tracknumber"] = str(track)
+    if disc:
+        tags["discnumber"] = str(disc)
     tags.save()
 
 
@@ -292,6 +302,7 @@ def spotify_tracks(url: str):
             "title": title,
             "album": name if kind == "album" else "",
             "duration": (t.get("duration") or 0) // 1000,
+            "track_number": len(tracks) + 1 if kind == "album" else 0,
         })
     return name, tracks
 
@@ -308,6 +319,9 @@ def deezer_tracks(url: str):
             "title": t.get("title") or t.get("title_short") or "",
             "album": (t.get("album") or {}).get("title") or album,
             "duration": t.get("duration") or 0,
+            "track_number": t.get("track_position") or 0,
+            "disc": t.get("disk_number") or 0,
+            "deezer_id": t.get("id"),
         }
 
     if kind == "track":
@@ -321,6 +335,16 @@ def deezer_tracks(url: str):
         page = http_json(nxt)
         tracks += [conv(t, name if kind == "album" else "") for t in page.get("data", [])]
         nxt = page.get("next")
+    # dans une playlist Deezer, le n° de piste de l'album n'est donné que par la fiche du titre
+    for t in tracks:
+        if not t["track_number"] and t.get("deezer_id"):
+            try:
+                d = http_json(f"https://api.deezer.com/track/{t['deezer_id']}")
+                t["track_number"] = d.get("track_position") or 0
+                t["disc"] = d.get("disk_number") or 0
+            except Exception:  # noqa: BLE001
+                pass
+            time.sleep(0.15)  # limite de l'API Deezer : 50 requêtes / 5 s
     return name, tracks
 
 
@@ -352,8 +376,8 @@ def resolve_import(imp):
             raise RuntimeError("Aucun titre trouvé")
         name = imp.get("forced_name") or name
         playlist = name if imp.get("m3u") else ""
-        for t in tracks:
-            new_job(t, playlist=playlist, import_id=imp["id"])
+        for pos, t in enumerate(tracks, 1):
+            new_job({**t, "position": pos}, playlist=playlist, import_id=imp["id"])
         update(imp, status="ok", name=name, count=len(tracks), message="")
     except Exception as e:  # noqa: BLE001
         update(imp, status="error", message=str(e).replace("ERROR: ", "")[:300])
@@ -459,6 +483,18 @@ def guess_from_info(info, job):
 
 
 # ---------------------------------------------------------------- traitement
+NUM_PREFIX_RE = re.compile(r"^\d{1,3}(?:-\d{1,3})?\s*[-.]\s*")
+
+
+def find_existing(folder: Path, base: str, recursive: bool = True):
+    """Cherche 'Artiste - Titre.mp3', avec ou sans numéro devant."""
+    if not folder.is_dir():
+        return None
+    files = folder.rglob("*.mp3") if recursive else folder.glob("*.mp3")
+    for f in files:
+        if f.stem == base or NUM_PREFIX_RE.sub("", f.stem, count=1) == base:
+            return f
+    return None
 def process(job):
     base_opts = {"quiet": True, "no_warnings": True, "noplaylist": True}
     update(job, status="searching", message="Recherche…")
@@ -511,12 +547,7 @@ def process(job):
     # déjà présent ? (avec l'organisation de dossiers actuelle)
     root, layout = music_dir(), settings["layout"]
     base = safe(f"{artist} - {title}")
-    if layout == "flat":
-        existing = root / f"{base}.mp3"
-        existing = existing if existing.exists() else None
-    else:
-        artist_dir = root / safe(artist)
-        existing = next(artist_dir.glob(f"**/{glob_escape(base)}.mp3"), None) if artist_dir.is_dir() else None
+    existing = find_existing(root if layout == "flat" else root / safe(artist), base, recursive=layout != "flat")
     if existing and not job.get("force"):
         update(job, status="exists", progress=100, message="Déjà présent", file=str(existing))
         return
@@ -554,7 +585,17 @@ def process(job):
         if not tmp_mp3.exists():
             raise RuntimeError("Fichier MP3 introuvable après conversion")
         album = job.get("album") or full.get("album") or DEFAULT_ALBUM
-        tag_mp3(tmp_mp3, artist, title, album, full.get("release_year") or "")
+        track = job.get("track_number") or int(full.get("track_number") or 0)
+        disc = job.get("disc") or 0
+        tag_mp3(tmp_mp3, artist, title, album, full.get("release_year") or "", track, disc)
+
+        mode = settings.get("numbering", "album")
+        num = track if mode == "album" else job.get("position", 0) if mode == "playlist" else 0
+        prefix = ""
+        if num:
+            prefix = f"{num:02d} - "
+            if mode == "album" and disc and disc > 1:
+                prefix = f"{disc}-{num:02d} - "
 
         if layout == "flat":
             folder = root
@@ -563,7 +604,7 @@ def process(job):
         else:
             folder = root / safe(artist)
         folder.mkdir(parents=True, exist_ok=True)
-        final = folder / f"{base}.mp3"
+        final = folder / f"{prefix}{base}.mp3"
         old = Path(job["file"]) if job.get("force") and job.get("file") else None
         if old and old != final and old.exists():
             old.unlink()                                  # on remplace la mauvaise version
@@ -606,6 +647,9 @@ def new_job(t: dict, playlist: str = "", import_id: str = ""):
         "title": (t.get("title") or "").strip(),
         "album": (t.get("album") or "").strip(),
         "duration": int(t.get("duration") or 0),
+        "track_number": int(t.get("track_number") or 0),
+        "disc": int(t.get("disc") or 0),
+        "position": int(t.get("position") or 0),
         "playlist": playlist,
         "import_id": import_id,
         "status": "pending",
@@ -636,12 +680,13 @@ def api_add():
     added = started = 0
 
     # titres structurés (import CSV)
-    for t in body.get("tracks") or []:
+    for i, t in enumerate(body.get("tracks") or [], 1):
         if t.get("title"):
-            new_job(t, playlist=playlist_name if m3u else "")
+            new_job({**t, "position": i}, playlist=playlist_name if m3u else "")
             added += 1
 
     plain_playlist = playlist_name if m3u else ""
+    pos = 0
     for line in (body.get("text") or "").splitlines():
         line = line.strip()
         src = classify(line)
@@ -658,7 +703,8 @@ def api_add():
             continue
         p = parse_line(line)
         if p:
-            new_job(p, playlist=plain_playlist)
+            pos += 1
+            new_job({**p, "position": pos}, playlist=plain_playlist)
             added += 1
     save_state()
     return jsonify({"added": added, "imports": started})
@@ -707,7 +753,7 @@ def api_clear():
 
 @app.get("/api/settings")
 def api_settings():
-    return jsonify({**settings, "layouts": LAYOUTS, "roots": [str(r) for r in BROWSE_ROOTS if r.is_dir()]})
+    return jsonify({**settings, "layouts": LAYOUTS, "numberings": NUMBERINGS, "roots": [str(r) for r in BROWSE_ROOTS if r.is_dir()]})
 
 
 @app.post("/api/settings")
@@ -726,6 +772,8 @@ def api_settings_save():
         new["music_dir"] = str(p.resolve())
     if body.get("layout") in LAYOUTS:
         new["layout"] = body["layout"]
+    if body.get("numbering") in NUMBERINGS:
+        new["numbering"] = body["numbering"]
     if "playlist_dir" in body:
         pd = str(body["playlist_dir"]).strip().strip("/")
         if not pd or ".." in Path(pd).parts:
@@ -842,6 +890,7 @@ Musique : <code id="curdir">…</code> · Playlists Navidrome : <code id="curpl"
  <div class="field" style="flex:1;min-width:220px"><label>Organisation des fichiers</label><select id="s_layout"></select></div>
  <div class="field" style="flex:1;min-width:220px"><label>Sous-dossier des playlists .m3u</label><input type="text" id="s_pl" style="max-width:none"></div>
 </div>
+<div class="field"><label>Numéro dans le nom du fichier</label><select id="s_num"></select></div>
 <div class="row"><button class="primary" onclick="saveSettings()">Enregistrer</button><button onclick="$('setcard').style.display='none'">Fermer</button>
  <span id="s_msg" class="toast"></span></div>
 </div>
@@ -943,6 +992,7 @@ function showSettings(){$('curdir').textContent=S.music_dir;$('curpl').textConte
 async function loadSettings(){S=await (await fetch('/api/settings')).json();showSettings();}
 function openSettings(){$('s_dir').value=S.music_dir;$('s_pl').value=S.playlist_dir;
  $('s_layout').innerHTML=Object.entries(S.layouts).map(([k,v])=>`<option value="${k}"${k===S.layout?' selected':''}>${esc(v)}</option>`).join('');
+ $('s_num').innerHTML=Object.entries(S.numberings).map(([k,v])=>`<option value="${k}"${k===S.numbering?' selected':''}>${esc(v)}</option>`).join('');
  $('browser').style.display='none';smsg('');$('setcard').style.display='block';}
 async function browse(p){const r=await fetch('/api/browse?path='+encodeURIComponent(p||''));let d=await r.json();
  if(!r.ok){if(p){return browse('');}smsg(d.error,true);return;}
@@ -956,7 +1006,7 @@ async function mkdir(){const n=$('b_new').value.trim();if(!n||!B.path)return;
  const d=await r.json();if(!r.ok){smsg(d.error,true);return;}$('b_new').value='';browse(d.path);}
 function pick(){if(!B.path)return;$('s_dir').value=B.path;$('browser').style.display='none';smsg('Dossier sélectionné — pense à enregistrer');}
 async function saveSettings(){const r=await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},
-  body:JSON.stringify({music_dir:$('s_dir').value,layout:$('s_layout').value,playlist_dir:$('s_pl').value})});
+  body:JSON.stringify({music_dir:$('s_dir').value,layout:$('s_layout').value,numbering:$('s_num').value,playlist_dir:$('s_pl').value})});
  const d=await r.json();if(!r.ok){smsg(d.error,true);return;}S=d;showSettings();smsg('Enregistré ✔ — les prochains téléchargements iront ici');}
 loadSettings();refresh();setInterval(refresh,2000);
 </script></body></html>"""
