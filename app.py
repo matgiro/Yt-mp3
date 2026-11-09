@@ -22,7 +22,7 @@ from flask import Flask, jsonify, request
 from mutagen.easyid3 import EasyID3
 from mutagen.id3 import ID3NoHeaderError
 
-APP_VERSION = "2026.11.09-2"
+APP_VERSION = "2026.11.09-3"
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
 # Dossiers de l'hôte visibles dans le conteneur (montés au même chemin) et explorables dans les réglages
 BROWSE_ROOTS = [Path(p.strip()) for p in os.environ.get("BROWSE_ROOTS", "/DATA,/media").split(",") if p.strip()]
@@ -35,14 +35,14 @@ DEFAULT_SETTINGS = {
     "numbering": os.environ.get("NUMBERING", "album"),     # album | playlist | none
 }
 NUMBERINGS = {
-    "album": "N° de piste dans l'album (01 - Artiste - Titre.mp3)",
-    "playlist": "Position dans la playlist (01 - Artiste - Titre.mp3)",
+    "album": "N° de piste dans l'album (01 - Titre.mp3)",
+    "playlist": "Position dans la playlist (01 - Titre.mp3)",
     "none": "Pas de numéro",
 }
 LAYOUTS = {
-    "flat": "Tout dans le même dossier",
-    "artist": "Artiste / Artiste - Titre.mp3",
-    "artist_album": "Artiste / Album / Artiste - Titre.mp3",
+    "flat": "Tout dans le même dossier (Artiste - Titre.mp3)",
+    "artist": "Artiste / Titre.mp3",
+    "artist_album": "Artiste / Album / Titre.mp3",
 }
 SETTINGS_FILE = DATA_DIR / "settings.json"
 TMP_DIR = DATA_DIR / "tmp"
@@ -486,13 +486,13 @@ def guess_from_info(info, job):
 NUM_PREFIX_RE = re.compile(r"^\d{1,3}(?:-\d{1,3})?\s*[-.]\s*")
 
 
-def find_existing(folder: Path, base: str, recursive: bool = True):
-    """Cherche 'Artiste - Titre.mp3', avec ou sans numéro devant."""
+def find_existing(folder: Path, names: set, recursive: bool = True):
+    """Cherche 'Titre.mp3' ou 'Artiste - Titre.mp3', avec ou sans numéro devant."""
     if not folder.is_dir():
         return None
     files = folder.rglob("*.mp3") if recursive else folder.glob("*.mp3")
     for f in files:
-        if f.stem == base or NUM_PREFIX_RE.sub("", f.stem, count=1) == base:
+        if f.stem in names or NUM_PREFIX_RE.sub("", f.stem, count=1) in names:
             return f
     return None
 def process(job):
@@ -546,8 +546,12 @@ def process(job):
 
     # déjà présent ? (avec l'organisation de dossiers actuelle)
     root, layout = music_dir(), settings["layout"]
-    base = safe(f"{artist} - {title}")
-    existing = find_existing(root if layout == "flat" else root / safe(artist), base, recursive=layout != "flat")
+    # nom du fichier : "NN - Titre.mp3" (artiste et album sont dans les dossiers et les tags ID3) ;
+    # en mode "tout dans le même dossier" on garde l'artiste dans le nom pour éviter les doublons
+    long_name = safe(f"{artist} - {title}")
+    base = long_name if layout == "flat" else safe(title)
+    existing = find_existing(root if layout == "flat" else root / safe(artist), {base, long_name},
+                             recursive=layout != "flat")
     if existing and not job.get("force"):
         update(job, status="exists", progress=100, message="Déjà présent", file=str(existing))
         return
